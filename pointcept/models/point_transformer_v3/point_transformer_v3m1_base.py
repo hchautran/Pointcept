@@ -34,7 +34,7 @@ from typing import Callable, Tuple
 
 import torch
 
-VALID_TOME_MODES = ["patch", "tome", "pool", "progressive", "pitome", "important_patch", "random_patch"]
+VALID_TOME_MODES = ["patch", "tome", "pool", "progressive", "pitome", "important_patch", "random_patch", "base"]
 
 class ValueReplace(torch.nn.Module):
     def __init__(self, channels):
@@ -329,6 +329,8 @@ class SerializedAttention(PointModule):
                                 threshold=self.additional_info["threshold"])
         elif self.additional_info["tome"] == 'tome':
             merge, unmerge = bipartite_soft_matching(v, r=r)
+        elif self.additional_info["tome"] == "base":
+            merge, unmerge = bipartite_soft_matching(v, r=0.0)
         elif self.additional_info["tome"] == 'pool':
             merge, unmerge = pool_reduction_sampling(v, self.additional_info["kernel_size"])
         elif self.additional_info["tome"] == 'important_patch':
@@ -345,6 +347,7 @@ class SerializedAttention(PointModule):
         H = self.num_heads
         K = self.patch_size
         C = self.channels
+        size = None
         # self.additional_info["patch_tome"] = True
         if (self.additional_info is not None) and \
                         self.additional_info["tome"] in VALID_TOME_MODES:
@@ -692,6 +695,7 @@ class SerializedPooling(PointModule):
         }.issubset(
             point.keys()
         ), "Run point.serialization() point cloud before SerializedPooling"
+        # breakpoint()
 
         code = point.serialized_code >> pooling_depth * 3
         code_, cluster, counts = torch.unique(

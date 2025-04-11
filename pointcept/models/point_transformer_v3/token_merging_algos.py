@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import spconv.pytorch as spconv
 
-def do_noting(x: torch.Tensor) -> torch.Tensor:
+def do_nothing(x: torch.Tensor, mode='sum') -> torch.Tensor:
    return x
 
 def important_patch_based_matching(
@@ -439,6 +439,7 @@ def patch_based_matching(
     t = metric.shape[2]
     
     gather = torch.gather
+    # breakpoint()
     
     if r <= 0:
         raise
