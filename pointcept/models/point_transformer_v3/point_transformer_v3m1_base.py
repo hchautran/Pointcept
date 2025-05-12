@@ -34,7 +34,7 @@ from typing import Callable, Tuple
 
 import torch
 
-VALID_TOME_MODES = ["patch", "tome", "pool", "progressive", "pitome", "important_patch", "random_patch", "base"]
+VALID_TOME_MODES = ["patch", "tome", "pool", "progressive", "pitome", "important_patch", "random_patch", "weighted_patch"]
 
 class ValueReplace(torch.nn.Module):
     def __init__(self, channels):
@@ -320,8 +320,163 @@ class SerializedAttention(PointModule):
             )
         return point[pad_key], point[unpad_key], point[cu_seqlens_key]
 
+    def process_weighted_merging(self, q, k, v, entropy, p ,low_r):
+        B, H, K, D = q.shape
+        num_l_patch = math.ceil(B  - B * p) - 1 
+        e_order = torch.argsort(entropy.squeeze(),  descending=False)
+        high = e_order[:-num_l_patch]
+        low = e_order[-num_l_patch:]
+        h_q, h_k, h_v = q[high], k[high], v[high]
+        l_v = v[low]
+        e_inverse = torch.argsort(torch.cat([high, low]))
+        h_merge, h_unmerge = patch_based_matching(
+            h_v, r=int(K*self.additional_info["r"]),
+            stride=self.additional_info['stride'],
+            no_rand=self.additional_info["no_rand"])
+
+        l_merge, l_unmerge = patch_based_matching(
+            l_v, r=K - low_r, 
+            stride=K//low_r,
+            no_rand=self.additional_info["no_rand"])
+        # l_merge, l_unmerge = pool_reduction_sampling(
+        #    x0=l_v, kernel_size=128//low_r,
+        # )
+        
+        h_size = torch.ones((h_v.shape[0], H, K, 1), device=v.device)
+        l_size = torch.ones((l_v.shape[0], H, K, 1), device=v.device)
+        h_size = h_merge(h_size, mode='sum')
+        # l_size = l_merge(l_size, mode='sum')
+        h_q = h_merge(h_q)
+        h_k = h_merge(h_k)
+        h_v = h_merge(h_v)
+        # l_q = l_merge(l_q)
+        # l_k = l_merge(l_k)
+
+        output = {
+            'high_q': h_q,
+            'high_k': h_k,
+            'high_v': h_v,
+            'low_q': None,
+            'low_k': None,
+            'low_v': l_v,
+            'high_size': h_size,
+            'high_merge': h_merge,
+            'high_unmerge': h_unmerge,
+            'low_size': l_size,
+            'low_merge': l_merge,
+            'low_unmerge': l_unmerge,
+            'e_inverse':e_inverse
+        }
+        return output 
+
+        
+    def cal_score(self, q:torch.Tensor, k:torch.Tensor, threshold=0.9):   
+        q = F.avg_pool1d(q.mean(1).transpose(-1, -2), kernel_size=64, stride=64).transpose(-1, -2).unsqueeze(1).expand(q.shape[0], q.shape[1], -1, q.shape[-1]) 
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
+        sim = q @ k.mean(-2, keepdim=True).transpose(-1, -2) 
+        score =  sim.squeeze().mean(-1).mean(-1)  #[B]
+        p = torch.where(score < threshold, 1.0, 0.0).sum(-1)/score.shape[0]
+        return  score, p 
+    
+    def weighted_forward(self, point):
+        self.patch_size = min(
+            offset2bincount(point['offset']).min().tolist(), self.patch_size_max
+        )
+
+        H = self.num_heads
+        K = self.patch_size
+        C = self.channels
+        
+        pad, unpad, cu_seqlens = self.get_padding_and_inverse(point)
+
+        order = point['serialized_order'][self.order_index][pad]
+        inverse = unpad[point['serialized_inverse'][self.order_index]]
+
+
+        # padding and reshape feat and batch for serialized point patch
+        qkv = self.qkv(point['feat'])[order]
+        q, k, v = (
+            qkv.reshape(-1, K, 3, H, C // H).permute(2, 0, 3, 1, 4).unbind(dim=0)
+        )
+        # attn
+        if self.upcast_attention:
+            q = q.float()
+            k = k.float()
+        
+        # print(q.shape)
+
+        if q.shape[0] > 100:
+            entropy, p = self.cal_score(v, v, 0.4)
+            if p >= 0.9:
+                q, k, v, size, _, unmerge = self.process_merging(q=q, k=k, v=v, order=order, inverse=inverse)
+                feat =  self.self_attn(
+                    q=q,
+                    k=k,
+                    v=v,
+                    size=size,
+                    unmerge=unmerge
+                )
+            else:
+                output = self.process_weighted_merging(q=q, k=k, v=v, entropy=entropy, p=p, low_r=self.additional_info['low_r'])
+                h_feat =  self.self_attn(
+                    q=output['high_q'],
+                    k=output['high_k'],
+                    v=output['high_v'],
+                    size=output['high_size'],
+                    unmerge=output['high_unmerge'],
+                )
+                l_feat =  self.self_attn(
+                    q=output['low_q'],
+                    k=output['low_k'],
+                    v=output['low_v'],
+                    size=output['low_size'],
+                    unmerge=output['low_unmerge'],
+                )
+                feat = torch.cat([h_feat, l_feat], dim=0)
+                feat = feat[output['e_inverse']]
+        else:
+            q, k, v, size, _, unmerge = self.process_merging(q=q, k=k, v=v, order=order, inverse=inverse)
+            feat =  self.self_attn(
+                q=q,
+                k=k,
+                v=v,
+                size=size,
+                unmerge=unmerge
+            )
+            
+        feat = feat.transpose(1, 2).reshape(-1, C) # (N * K, C)
+        feat = feat[inverse]
+        # Projection layer
+        feat = self.proj(feat)
+        feat = self.proj_drop(feat)
+        point['feat'] = feat
+        return point
+
+        
+    def self_attn(self, q, k ,v,  unmerge, size=None):
+                        # Original attention mechanism
+        H = self.num_heads
+        K = self.patch_size
+        C = self.channels
+        if v.shape[-2] > 1:
+            attn = (q * self.scale) @ k.transpose(-2, -1)  # (N', H, K, K)
+            if size is not None:
+                attn = attn + size.log()
+            if self.upcast_softmax:
+                attn = attn.float()
+            attn = self.softmax(attn)
+            attn = self.attn_drop(attn).to(v.dtype) 
+            feat = (attn @ v) # (N', H, K, C // H)
+        else:
+            feat = v
+            print(feat.shape)
+
+        feat = self.process_unreduction(feat, unmerge) # (N, H, K, C // H)
+        return feat
+
     def token_merge_method(self, v, r):
-        if self.additional_info["tome"] == 'patch':
+        if self.additional_info["tome"] == 'patch' or  self.additional_info["tome"] == 'weighted_patch':
             merge, unmerge = patch_based_matching(v, r=r, 
                                     stride=self.additional_info["stride"])
         elif self.additional_info["tome"] == 'progressive':
@@ -409,6 +564,14 @@ class SerializedAttention(PointModule):
         H = self.num_heads
         K = self.patch_size
         C = self.channels
+
+        if self.additional_info is not None and "copy_point" in self.additional_info.keys():
+            from copy import deepcopy
+            if self.additional_info["copy_point"]:
+                self.copy_point = deepcopy(point)
+        
+        if self.additional_info is not None and self.additional_info['tome'] == 'weighted_patch' :
+            return self.weighted_forward(point)
         
         pad, unpad, cu_seqlens = self.get_padding_and_inverse(point)
 
@@ -442,6 +605,7 @@ class SerializedAttention(PointModule):
             else:
                 # Original attention mechanism
                 attn = (q * self.scale) @ k.transpose(-2, -1)  # (N', H, K, K)
+                print(attn.shape)
 
                 if (self.additional_info is not None) and \
                         self.additional_info["tome"] in VALID_TOME_MODES: 
